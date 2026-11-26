@@ -1,0 +1,126 @@
+---
+title: "LSABD group project – Part 1b: preprocessing"
+author: "Group XX"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+    code_folding: show
+---
+
+<!--
+PURPOSE  Turn the raw NHANES file into ONE clean dataset that Parts 2, 3 and 4
+         all use. Every step is justified by a finding in 01_exploration.
+INPUT    data/raw/NHANES_20212023_merged_filtered_1.csv + codebook
+OUTPUT   data/processed/nhanes_clean.csv     (participants x selected variables)
+         data/processed/variable_info.csv    (one row per kept variable: label, role, transformation)
+OWNER    Person 1
+RULE     Downstream scripts never repeat cleaning steps: if something needs to
+         change, change it HERE and re-knit, so every part uses the same data.
+-->
+
+```{r setup, include = FALSE}
+source(here::here("R", "utils.R"))
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      fig.width = 9, fig.height = 5, dpi = 150,
+                      dev = c("png", "cairo_pdf"),
+                      fig.path = file.path(paths$figures, "02_preprocessing", ""))
+```
+
+```{r load}
+nhanes_raw <- load_raw_data()
+codebook   <- load_codebook()
+dim(nhanes_raw)
+```
+
+# Study population
+
+<!-- TODO: which participants are analysed, and why?
+     e.g. examined participants only (RIDSTATR == 2), adults (RIDAGEYR >= 20),
+     pregnant women excluded (RIDEXPRG == 1). Report how many are removed per step. -->
+
+```{r population}
+nhanes_clean <- nhanes_raw   # TODO: filter()
+
+# Keep a log of every step: rows left after each filter (useful for a flow diagram)
+```
+
+# Variable selection
+
+<!-- TODO: drop columns that are not features: survey weights / design variables,
+     comment codes (keep the LOD flags you need first), unit duplicates (SI copies),
+     completely empty variables (BMIHEAD). -->
+
+```{r variables}
+```
+
+# Disguised missing values
+
+<!-- TODO: recode "refused" / "don't know" codes (7/9, 77/99, 777/999, ...) to NA
+     for the variables flagged in 01_exploration section 5.1. -->
+
+```{r special-codes}
+```
+
+# Values below the limit of detection
+
+<!-- TODO: decide per variable: drop variables with > 50 % below LOD; for the
+     others keep the NHANES substitute (LOD / sqrt(2)) and state this. -->
+
+```{r lod}
+```
+
+# Missing values
+
+<!-- TODO: per variable, decide: restrict to the eligible group (structural
+     missingness), complete-case analysis, or imputation (only for non-response,
+     and say which method). Report what you did and how many values it affects. -->
+
+```{r missing}
+```
+
+# Transformations
+
+<!-- TODO: log-transform right-skewed variables (skewness > 1); recode categorical
+     variables as labelled factors (sex, ethnicity, education); average the three
+     blood pressure readings. Standardisation (z-scores) is done later inside the
+     analyses that need it (PCA, ML), not here. -->
+
+```{r transformations}
+```
+
+# Outliers
+
+<!-- TODO: check extremes against related variables (repeated BP readings,
+     glucose vs HbA1c, ...). Remove only proven errors; document every removal. -->
+
+```{r outliers}
+```
+
+# Quality check after preprocessing
+
+<!-- TODO: re-run a PCA / summary on the clean data and compare with 01_exploration:
+     do samples now group by biology rather than by technical factors? -->
+
+```{r qc}
+```
+
+# Save the clean dataset
+
+```{r save}
+dir.create(dirname(paths$clean_data), recursive = TRUE, showWarnings = FALSE)
+write_csv(nhanes_clean, paths$clean_data)
+
+variable_info <- codebook %>% filter(variable %in% names(nhanes_clean))
+write_csv(variable_info, paths$clean_vars)
+
+dim(nhanes_clean)
+```
+
+# Session information
+
+```{r session-info}
+sessionInfo()
+```

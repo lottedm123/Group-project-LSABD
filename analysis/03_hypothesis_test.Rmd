@@ -1,0 +1,86 @@
+---
+title: "LSABD group project – Part 2: research question and hypothesis test"
+author: "Group XX"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+    code_folding: show
+---
+
+<!--
+PURPOSE  Formulate one multivariable research question, test it with an
+         appropriate model, visualise the result and draw a conclusion.
+INPUT    data/processed/nhanes_clean.csv (via load_clean_data())
+OUTPUT   results/figures/fig_03_*, results/tables/tab_03_*
+OWNER    Person 2
+
+ASSIGNMENT REQUIREMENTS
+  - one outcome + at least two explanatory variables (adjustment, interaction
+    or combined effect)
+  - testable with the data provided (check before committing)
+RUBRIC (5/5)
+  - hypothesis clearly defined, relevant, multivariable
+  - correct test for the data type; assumptions checked (normality of residuals,
+    equal variance, independence); p-values, confidence intervals and effect
+    sizes explained
+  - publication-quality figure that directly supports the hypothesis
+-->
+
+```{r setup, include = FALSE}
+source(here::here("R", "utils.R"))
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      fig.width = 8, fig.height = 5, dpi = 150)
+```
+
+```{r load}
+nhanes <- load_clean_data()
+```
+
+# Research question and hypothesis
+
+<!-- TODO: background (why relevant), research question, H0 and H1,
+     outcome, explanatory variables, adjustment variables. -->
+
+# Analysis data
+
+<!-- TODO: select the variables for this question; report n (complete cases)
+     and descriptive statistics per group (table). -->
+
+```{r analysis-data}
+```
+
+# Model
+
+<!-- TODO: fit the model (e.g. lm() / glm()); justify the choice of model. -->
+
+```{r model}
+```
+
+## Assumption checks
+
+<!-- TODO: residual plots, normality (QQ-plot), equal variance, influential points. -->
+
+```{r assumptions}
+```
+
+# Results
+
+<!-- TODO: estimates with 95 % CI and p-values (table), effect size in
+     interpretable units; main figure saved with save_figure(). -->
+
+```{r results}
+```
+
+# Interpretation and conclusion
+
+<!-- TODO: answer the research question; limitations (cross-sectional,
+     unweighted analysis, unmeasured confounders, ...). -->
+
+# Session information
+
+```{r session-info}
+sessionInfo()
+```

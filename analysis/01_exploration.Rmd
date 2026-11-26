@@ -1,0 +1,774 @@
+---
+title: "LSABD group project – Part 1a: exploration of the raw NHANES 2021–2023 data"
+author: "Group XX"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+    code_folding: show
+---
+
+<!--
+PURPOSE
+  Explore the raw, merged NHANES 2021-2023 file BEFORE any cleaning, so that
+  every preprocessing decision in 02_preprocessing.Rmd can be justified with
+  evidence from this report. Nothing is removed or changed in the data here:
+  this script only looks, counts and plots.
+
+INPUT   data/raw/NHANES_20212023_merged_filtered_1.csv     (11 933 participants x 486 variables)
+        data/raw/NHANES_20212023_codebook_filtered_1.csv   (one row per variable)
+OUTPUT  this HTML report + every figure as PNG and PDF in results/figures/01_exploration/
+OWNER   Person 1
+-->
+
+```{r setup, include = FALSE}
+source(here::here("R", "utils.R"))   # paths, palette, theme, load_*() helpers
+
+knitr::opts_chunk$set(
+  echo = TRUE, message = FALSE, warning = FALSE,
+  fig.width = 9, fig.height = 5, dpi = 150,
+  dev = c("png", "cairo_pdf"),       # PNG for the HTML, vector PDF for the report
+  fig.path = file.path(paths$figures, "01_exploration", "")
+)
+```
+
+```{r libraries}
+library(patchwork)   # combine ggplots into one figure
+library(scales)      # axis label helpers
+set.seed(2026)       # only used for the random subset in the missingness matrix
+```
+
+# Loading the data
+
+## Reading the files
+
+Two practical pitfalls are handled here:
+
+* **Column type guessing.** `read_csv()` guesses each column's type from the
+  first 1 000 rows by default. Many NHANES variables are empty for the first
+  1 000 participants (e.g. variables measured only in a subsample), so a column
+  can be guessed wrongly and its later values silently turned into `NA`. We
+  therefore let readr look at all rows (`guess_max`).
+* **Encoding of the codebook.** The codebook is not UTF-8 but Windows-1252
+  (it contains typographic apostrophes and the `µ` sign); reading it with the
+  default encoding fails or garbles the labels.
+
+```{r load}
+nhanes_raw <- load_raw_data()    # defined in R/utils.R: read_csv() with guess_max = 20000
+codebook   <- load_codebook()    # defined in R/utils.R: Windows-1252 encoding
+```
+
+What would have gone wrong with the default `guess_max`? We read the file a
+second time with default settings and compare how many values are present in
+each column.
+
+```{r guess-max-check}
+nhanes_default <- read_csv(paths$raw_data, show_col_types = FALSE)   # readr defaults
+values_lost <- tibble(
+  variable      = names(nhanes_raw),
+  present_full  = colSums(!is.na(nhanes_raw)),
+  present_guess = colSums(!is.na(nhanes_default))
+) %>%
+  filter(present_full != present_guess)
+
+nrow(values_lost)   # number of columns that would have lost values
+values_lost
+rm(nhanes_default)
+```
+
+## Basic integrity checks
+
+```{r integrity}
+dim(nhanes_raw)                                     # participants x variables
+
+# Is SEQN a unique participant identifier (one row = one person)?
+n_distinct(nhanes_raw$SEQN) == nrow(nhanes_raw)
+
+# Do data and codebook describe exactly the same variables, in the same order?
+setequal(names(nhanes_raw), codebook$variable)
+identical(names(nhanes_raw), codebook$variable)
+
+# How were the columns read?
+table(map_chr(nhanes_raw, ~ class(.x)[1]))
+names(nhanes_raw)[map_lgl(nhanes_raw, is.character)]  # the only non-numeric column(s)
+
+# Completely empty variables (read as "logical" because there is nothing to guess from)
+names(nhanes_raw)[colSums(!is.na(nhanes_raw)) == 0]
+```
+
+# What kinds of variables are there?
+
+The 486 columns are not all "features". Using the codebook we give every
+variable a **role**:
+
+* `identifier`: SEQN.
+* `survey design / weight`: sampling weights (`WT...`) and design variables
+  (strata, PSU, release cycle). They describe how participants were sampled,
+  not the participants themselves.
+* `comment code`: flags belonging to another variable, mostly "value was below
+  the limit of detection" (see section 6).
+* `unit duplicate`: the same measurement reported a second time in another unit
+  (e.g. cholesterol in mg/dL **and** mmol/L). Detected as two variables in the
+  same data file whose labels are identical apart from the unit in brackets.
+* `measurement`: everything else, i.e. the actual candidate features.
+
+```{r variable-roles}
+n_distinct_values <- map_int(nhanes_raw, ~ n_distinct(.x, na.rm = TRUE))
+pct_missing_all   <- colMeans(is.na(nhanes_raw)) * 100
+
+var_info <- codebook %>%
+  mutate(
+    position    = row_number(),
+    n_distinct  = n_distinct_values[variable],
+    pct_missing = pct_missing_all[variable],
+    # label without a trailing "(unit)", used to find unit duplicates
+    base_label  = str_trim(str_remove(label, "\\s*\\([^()]*\\)\\s*$")),
+    role = case_when(
+      variable == "SEQN" ~ "identifier",
+      str_detect(variable, "^WT") |
+        variable %in% c("SDDSRVYR", "SDMVSTRA", "SDMVPSU") ~ "survey design / weight",
+      str_detect(label, regex("comment|cmt|comt", ignore_case = TRUE)) ~ "comment code",
+      TRUE ~ "measurement"
+    )
+  ) %>%
+  # second (and later) variable with the same base label in the same file =
+  # unit duplicate. FASTQX_L is excluded: there "(hours)" and "(minutes)" are
+  # two halves of one duration, not duplicates.
+  group_by(file, base_label, role) %>%
+  mutate(role = if_else(role == "measurement" & file != "FASTQX_L" & row_number() > 1,
+                        "unit duplicate", role)) %>%
+  ungroup()
+
+count(var_info, role)
+```
+
+The unit duplicates that were detected (checked numerically in section 9):
+
+```{r unit-duplicates}
+var_info %>% filter(role == "unit duplicate") %>% select(variable, label, file) %>%
+  knitr::kable()
+```
+
+For the measurement variables we also make a first, **heuristic** guess of the
+data type from the number of distinct values. This is only a starting point:
+whether a coded variable is nominal or ordinal (e.g. education level) must be
+checked in the NHANES documentation for each variable that we end up using.
+
+```{r variable-types}
+var_info <- var_info %>%
+  mutate(type_guess = case_when(
+    role != "measurement" ~ NA_character_,
+    n_distinct <= 2       ~ "binary",
+    n_distinct <= 15      ~ "categorical / coded",
+    TRUE                  ~ "continuous / count"
+  ))
+
+var_info %>% filter(role == "measurement") %>%
+  count(component, type_guess) %>%
+  pivot_wider(names_from = type_guess, values_from = n, values_fill = 0) %>%
+  knitr::kable()
+```
+
+```{r fig-variable-roles, fig.height = 8}
+ggplot(var_info, aes(y = fct_rev(fct_inorder(file)), fill = role)) +
+  geom_bar() +
+  facet_grid(component ~ ., scales = "free_y", space = "free_y") +
+  scale_fill_manual(values = okabe_ito) +
+  labs(x = "number of variables", y = "NHANES data file", fill = "role",
+       title = "Composition of the merged file: only part of the 486 columns are features") +
+  theme(strip.text.y = element_text(angle = 0), legend.position = "bottom")
+```
+
+# Who is in the data?
+
+```{r participants}
+participants <- nhanes_raw %>%
+  transmute(
+    SEQN,
+    age    = RIDAGEYR,
+    sex    = factor(RIAGENDR, levels = 1:2, labels = c("Male", "Female")),
+    status = factor(RIDSTATR, levels = 1:2,
+                    labels = c("Interview only", "Interview + examination")),
+    ethnicity = factor(RIDRETH3, levels = c(1, 2, 3, 4, 6, 7),
+                       labels = c("Mexican American", "Other Hispanic",
+                                  "Non-Hispanic White", "Non-Hispanic Black",
+                                  "Non-Hispanic Asian", "Other / multiracial")),
+    group = case_when(
+      RIDSTATR == 1  ~ "Interview only",
+      RIDAGEYR < 20  ~ "Examined, < 20 y",
+      TRUE           ~ "Examined, \u2265 20 y"
+    ) %>% factor(levels = c("Interview only", "Examined, < 20 y", "Examined, \u2265 20 y"))
+  )
+
+count(participants, status)
+count(participants, group)
+count(participants, sex)
+sum(participants$age == 80)   # participants at the age cap
+```
+
+```{r fig-age-sex, fig.height = 5}
+ggplot(participants, aes(x = age, fill = sex)) +
+  geom_histogram(binwidth = 1, boundary = 0) +
+  geom_vline(xintercept = 20, linetype = "dashed") +
+  annotate("text", x = 78, y = Inf, vjust = 1.5, hjust = 1, size = 3.2,
+           label = "spike at 80:\nall ages \u2265 80 are\nrecorded as 80") +
+  facet_wrap(~ status, ncol = 1) +
+  scale_fill_manual(values = okabe_ito[c(2, 1)]) +
+  labs(x = "age at screening (years)", y = "participants",
+       title = "Age distribution: children are included, ages above 80 are capped",
+       subtitle = "dashed line = age 20, the usual lower limit for adult analyses")
+```
+
+```{r fig-ethnicity, fig.height = 3.5}
+ggplot(participants, aes(y = fct_rev(fct_infreq(ethnicity)))) +
+  geom_bar(fill = okabe_ito[4]) +
+  geom_text(aes(label = after_stat(count)), stat = "count", hjust = -0.2, size = 3.2) +
+  scale_x_continuous(expand = expansion(mult = c(0, 0.12))) +
+  labs(x = "participants", y = NULL, title = "Self-reported race / Hispanic origin (RIDRETH3)")
+```
+
+# Missing data
+
+## How much is missing per variable?
+
+```{r fig-missing-per-variable}
+pct_interview_only <- 100 * mean(nhanes_raw$RIDSTATR == 1)
+
+var_info %>%
+  filter(role == "measurement") %>%
+  ggplot(aes(x = fct_reorder(variable, pct_missing), y = pct_missing, colour = component)) +
+  geom_point(size = 1) +
+  geom_hline(yintercept = pct_interview_only, linetype = "dashed") +
+  annotate("text", x = 5, y = pct_interview_only + 4, hjust = 0, size = 3.2,
+           label = sprintf("%.1f %% of participants were never examined", pct_interview_only)) +
+  scale_colour_manual(values = okabe_ito) +
+  scale_y_continuous(limits = c(0, 100)) +
+  labs(x = "measurement variables, sorted by % missing", y = "% missing",
+       title = "No lab or exam variable can be less incomplete than the share of non-examined participants") +
+  theme(axis.text.x = element_blank(), axis.ticks.x = element_blank(),
+        legend.position = "bottom")
+```
+
+## Is missingness random, or caused by the study design?
+
+If values were missing completely at random (MCAR), the percentage missing
+would be similar in every group of participants. Here we compare three groups
+defined by the design: not examined, examined children/teenagers, examined
+adults. Each tile is the average % missing over all measurement variables of
+one data file.
+
+```{r missing-by-group}
+measurement_vars <- var_info %>% filter(role == "measurement") %>% pull(variable)
+
+missing_by_group <- nhanes_raw %>%
+  mutate(group = participants$group) %>%
+  group_by(group) %>%
+  summarise(across(all_of(measurement_vars), ~ 100 * mean(is.na(.x)))) %>%
+  pivot_longer(-group, names_to = "variable", values_to = "pct_missing") %>%
+  left_join(select(var_info, variable, file, component), by = "variable") %>%
+  group_by(group, component, file) %>%
+  summarise(pct_missing = mean(pct_missing), .groups = "drop")
+```
+
+```{r fig-missing-by-group, fig.height = 9}
+ggplot(missing_by_group, aes(x = group, y = fct_rev(fct_inorder(file)), fill = pct_missing)) +
+  geom_tile(colour = "white") +
+  geom_text(aes(label = round(pct_missing)), size = 3) +
+  facet_grid(component ~ ., scales = "free_y", space = "free_y") +
+  scale_fill_gradient(low = "white", high = okabe_ito[6], limits = c(0, 100)) +
+  labs(x = NULL, y = "NHANES data file", fill = "% missing",
+       title = "Missingness depends on who was examined and on their age: it is not MCAR") +
+  theme(strip.text.y = element_text(angle = 0))
+```
+
+## Missingness pattern at the participant level
+
+A random subset of 400 participants (rows, sorted by age within each group) by
+all measurement variables (columns, in codebook order). Vertical blocks of
+missing values that start and stop at file boundaries show that whole lab
+panels are either measured or not (subsamples).
+
+```{r fig-missing-matrix, fig.height = 7, fig.width = 11}
+subset_ids <- participants %>% slice_sample(n = 400) %>% arrange(group, age) %>%
+  mutate(row = row_number())
+
+nhanes_raw %>%
+  filter(SEQN %in% subset_ids$SEQN) %>%
+  select(SEQN, all_of(measurement_vars)) %>%
+  mutate(across(-SEQN, is.na)) %>%
+  pivot_longer(-SEQN, names_to = "variable", values_to = "missing") %>%
+  left_join(select(subset_ids, SEQN, row, group), by = "SEQN") %>%
+  left_join(select(var_info, variable, position, component), by = "variable") %>%
+  mutate(column = dense_rank(position)) %>%   # consecutive columns, no gaps
+  ggplot(aes(x = column, y = row, fill = missing)) +
+  geom_raster() +
+  facet_grid(group ~ component, scales = "free", space = "free",
+             labeller = labeller(component = c(Demographics = "Demo", Examination = "Exam",
+                                               Laboratory = "Laboratory",
+                                               Questionnaire = "Questionnaire"))) +
+  scale_fill_manual(values = c(`FALSE` = "grey85", `TRUE` = "black"),
+                    labels = c("present", "missing")) +
+  scale_y_reverse() +
+  labs(x = "variables (codebook order)", y = "participants (sorted by age)", fill = NULL,
+       title = "Missingness comes in blocks: whole lab panels are measured or not") +
+  theme(axis.text = element_blank(), axis.ticks = element_blank(),
+        strip.text.y = element_text(angle = 0), legend.position = "bottom")
+```
+
+# Values that are not real measurements
+
+## Codes for "refused" and "don't know"
+
+NHANES stores answers such as *refused* and *don't know* as numbers
+(typically 7/9, 77/99, 777/999, ...) instead of `NA`. `is.na()` does not see
+them, and a mean or regression would treat them as real values.
+
+Detection rule (heuristic): for every questionnaire, demographic and fasting
+variable, a value from {7, 9, 77, 99, 777, 999, ...} is flagged when it is
+**larger than every other value of that variable, with a gap** (more than 1
+above the largest regular value). This catches e.g. the 9 in education
+(regular values 1–5) but not a real answer of 7 drinks per day, nor real
+categories that simply continue the scale, such as code 7 "other race /
+multiracial" in RIDRETH3 (values 1, 2, 3, 4, 6, 7) or "7 or more people" in
+household size (1–7). Every
+flagged variable must still be checked against the NHANES documentation.
+
+```{r special-codes}
+code_values <- c(7, 9, 77, 99, 777, 999, 7777, 9999, 77777, 99999, 777777, 999999)
+
+scan_vars <- var_info %>%
+  filter(role == "measurement",
+         component %in% c("Demographics", "Questionnaire") | file == "FASTQX_L") %>%
+  pull(variable)
+
+find_special_codes <- function(x) {
+  x <- x[!is.na(x)]
+  if (!is.numeric(x)) return(NULL)
+  regular <- x[!x %in% code_values]
+  if (length(regular) == 0) return(NULL)
+  suspects <- x[x %in% code_values & x > max(regular) + 1]
+  if (length(suspects) == 0) return(NULL)
+  count(tibble(code = suspects), code)
+}
+
+special_codes <- map(set_names(scan_vars), ~ find_special_codes(nhanes_raw[[.x]])) %>%
+  compact() %>%
+  bind_rows(.id = "variable") %>%
+  left_join(select(var_info, variable, label), by = "variable") %>%
+  relocate(label, .after = variable)
+
+knitr::kable(special_codes)
+```
+
+## Capped (top-coded) values
+
+Some continuous variables are capped for privacy reasons: everybody above the
+cap gets the cap value. This shows up as a spike at the maximum.
+
+```{r fig-top-coding, fig.height = 3.5}
+p_age <- ggplot(nhanes_raw, aes(RIDAGEYR)) +
+  geom_histogram(binwidth = 1, fill = okabe_ito[2]) +
+  labs(x = "age (RIDAGEYR), cap = 80", y = "participants")
+p_pir <- ggplot(filter(nhanes_raw, !is.na(INDFMPIR)), aes(INDFMPIR)) +
+  geom_histogram(binwidth = 0.1, fill = okabe_ito[2]) +
+  labs(x = "income-to-poverty ratio (INDFMPIR), cap = 5", y = "participants")
+p_age + p_pir + plot_annotation(title = "Top-coded variables: a spike at the maximum value")
+```
+
+```{r top-coding-counts}
+c(age_80 = sum(nhanes_raw$RIDAGEYR == 80),
+  income_ratio_5 = sum(nhanes_raw$INDFMPIR == 5, na.rm = TRUE))
+```
+
+## Values below the limit of detection (LOD)
+
+For many lab tests a comment code tells whether the value was **below the
+limit of detection** (code 1) or not (code 0). For those results NHANES does
+not store the (unknown) true value but a fixed substitute (LOD / √2). Each
+comment code is linked to the measurement it belongs to (the nearest preceding
+measurement variable in the same file).
+
+```{r lod}
+measurement_positions <- var_info %>% filter(role == "measurement") %>%
+  select(position, file, variable)
+
+lod_info <- var_info %>%
+  filter(role == "comment code", component == "Laboratory") %>%
+  select(comment_variable = variable, position, file) %>%
+  mutate(variable = map2_chr(position, file, function(p, f) {
+    measurement_positions %>% filter(file == f, position < p) %>%
+      slice_max(position, n = 1) %>% pull(variable)
+  })) %>%
+  mutate(
+    n_measured    = map_int(comment_variable, ~ sum(!is.na(nhanes_raw[[.x]]))),
+    pct_below_lod = map_dbl(comment_variable, ~ 100 * mean(nhanes_raw[[.x]] == 1, na.rm = TRUE))
+  ) %>%
+  left_join(select(var_info, variable, label), by = "variable")
+
+# sanity check: comment codes only contain 0 / 1
+map(lod_info$comment_variable, ~ unique(na.omit(nhanes_raw[[.x]]))) %>% unlist() %>% unique()
+
+summarise(lod_info,
+          n_lab_tests_with_lod_flag = n(),
+          more_than_half_below_lod  = sum(pct_below_lod > 50))
+```
+
+```{r fig-lod, fig.height = 13}
+lod_info %>%
+  filter(pct_below_lod > 0) %>%
+  mutate(label = str_trunc(label, 45)) %>%
+  ggplot(aes(x = pct_below_lod, y = fct_reorder(label, pct_below_lod), fill = file)) +
+  geom_col() +
+  geom_vline(xintercept = 50, linetype = "dashed") +
+  scale_fill_manual(values = rep(okabe_ito, 2)) +
+  labs(x = "% of measured participants below the limit of detection", y = NULL,
+       fill = "data file",
+       title = "Many exposure markers (VOCs, PFAS, metals) are mostly below the detection limit",
+       subtitle = "only lab tests with at least one value below LOD are shown") +
+  theme(axis.text.y = element_text(size = 7))
+```
+
+What this looks like in the values themselves, for blood cadmium:
+
+```{r fig-lod-cadmium, fig.height = 3.5}
+nhanes_raw %>%
+  filter(!is.na(LBXBCD)) %>%
+  mutate(below_lod = factor(LBDBCDLC, levels = 0:1, labels = c("measured", "below LOD"))) %>%
+  ggplot(aes(x = LBXBCD, fill = below_lod)) +
+  geom_histogram(bins = 60) +
+  scale_x_log10() +
+  scale_fill_manual(values = okabe_ito[c(2, 6)]) +
+  labs(x = "blood cadmium (\u00b5g/L, log scale)", y = "participants", fill = NULL,
+       title = "All values below the LOD share one substitute value: a spike, not real variation")
+```
+
+# Distributions of the continuous measurements
+
+From here on we look at **examined** participants only, because the others
+have no exam or lab data.
+
+```{r distribution-summary}
+examined <- nhanes_raw %>% filter(RIDSTATR == 2)
+
+skewness <- function(x) {
+  x <- x[!is.na(x)]
+  if (length(x) < 3 || sd(x) == 0) return(NA_real_)
+  mean((x - mean(x))^3) / sd(x)^3
+}
+
+continuous_vars <- var_info %>%
+  filter(type_guess == "continuous / count", component %in% c("Examination", "Laboratory")) %>%
+  pull(variable)
+
+distribution_summary <- map_dfr(continuous_vars, function(v) {
+  x <- examined[[v]]
+  tibble(variable = v, n = sum(!is.na(x)),
+         min = min(x, na.rm = TRUE), median = median(x, na.rm = TRUE),
+         max = max(x, na.rm = TRUE), skewness = skewness(x))
+}) %>%
+  left_join(select(var_info, variable, label), by = "variable")
+
+length(continuous_vars)
+sum(distribution_summary$skewness > 1, na.rm = TRUE)   # strongly right-skewed
+sum(distribution_summary$min < 0)                      # impossible negative values?
+
+distribution_summary %>% slice_max(skewness, n = 10) %>%
+  select(variable, label, min, median, max, skewness) %>%
+  knitr::kable(digits = 2)
+```
+
+```{r fig-skewness, fig.height = 3.5}
+ggplot(distribution_summary, aes(skewness)) +
+  geom_histogram(bins = 50, fill = okabe_ito[4]) +
+  geom_vline(xintercept = c(-1, 1), linetype = "dashed") +
+  scale_x_continuous(trans = pseudo_log_trans(base = 10),
+                     breaks = c(-10, -1, 0, 1, 10, 100)) +
+  labs(x = "skewness (pseudo-log axis)", y = "number of variables",
+       title = "Most continuous lab variables are strongly right-skewed (skewness > 1)")
+```
+
+Raw versus log-transformed distributions for a few key variables (examined
+adults):
+
+```{r fig-raw-vs-log, fig.height = 6, fig.width = 11}
+key_vars <- c("BMXBMI", "LBXGH", "LBXHSCRP", "LBXCOT", "LBXSATSI", "LBXBPB")
+key_labels <- var_info %>% filter(variable %in% key_vars) %>%
+  mutate(facet = str_wrap(paste0(variable, ": ", label), 22)) %>%
+  select(variable, facet)
+
+key_long <- examined %>%
+  filter(RIDAGEYR >= 20) %>%
+  select(all_of(key_vars)) %>%
+  pivot_longer(everything(), names_to = "variable", values_to = "value") %>%
+  filter(!is.na(value)) %>%
+  left_join(key_labels, by = "variable")
+
+p_raw <- ggplot(key_long, aes(value)) +
+  geom_histogram(bins = 50, fill = okabe_ito[2]) +
+  facet_wrap(~ facet, nrow = 1, scales = "free") +
+  labs(x = "raw value", y = "participants")
+p_log <- ggplot(key_long, aes(log10(value))) +
+  geom_histogram(bins = 50, fill = okabe_ito[3]) +
+  facet_wrap(~ facet, nrow = 1, scales = "free") +
+  labs(x = "log10(value)", y = "participants")
+
+p_raw / p_log +
+  plot_annotation(title = "Log transformation makes most skewed variables roughly symmetric",
+                  subtitle = paste("cotinine: spike = values below the LOD, then two groups (non-smokers vs. smokers);",
+                                   "HbA1c keeps a right tail (diabetes range)")) &
+  theme(strip.text = element_text(size = 7))
+```
+
+Some variables are not skewed but **bimodal because of biology**, for example
+testosterone, which differs by an order of magnitude between men and women:
+
+```{r fig-testosterone, fig.height = 3.5}
+examined %>%
+  filter(RIDAGEYR >= 20, !is.na(LBXTST)) %>%
+  mutate(sex = factor(RIAGENDR, 1:2, c("Male", "Female"))) %>%
+  ggplot(aes(x = LBXTST, fill = sex)) +
+  geom_density(alpha = 0.6, colour = NA) +
+  scale_x_log10() +
+  scale_fill_manual(values = okabe_ito[c(2, 1)]) +
+  labs(x = "total testosterone (ng/dL, log scale)", y = "density", fill = NULL,
+       title = "Testosterone: two populations, so analyses must account for sex")
+```
+
+# Outliers
+
+Outliers are flagged with the box-plot (IQR) rule: below Q1 − 1.5·IQR or
+above Q3 + 1.5·IQR. On skewed data this rule flags many values that are simply
+the long tail of the distribution, so we compare the raw scale with the log
+scale (variables with only positive values).
+
+```{r outliers}
+iqr_outlier_pct <- function(x) {
+  x <- x[!is.na(x)]
+  q <- quantile(x, c(0.25, 0.75)); iqr <- diff(q)
+  100 * mean(x < q[1] - 1.5 * iqr | x > q[2] + 1.5 * iqr)
+}
+
+outlier_summary <- map_dfr(continuous_vars, function(v) {
+  x <- examined[[v]]
+  tibble(variable = v,
+         pct_outlier_raw = iqr_outlier_pct(x),
+         pct_outlier_log = if (min(x, na.rm = TRUE) > 0) iqr_outlier_pct(log10(x)) else NA_real_)
+})
+
+summarise(outlier_summary,
+          median_pct_raw = median(pct_outlier_raw),
+          median_pct_log = median(pct_outlier_log, na.rm = TRUE))
+```
+
+```{r fig-outliers, fig.height = 4.5, fig.width = 5.5}
+ggplot(outlier_summary, aes(pct_outlier_raw, pct_outlier_log)) +
+  geom_abline(linetype = "dashed") +
+  geom_point(colour = okabe_ito[4], alpha = 0.7) +
+  coord_equal() +
+  labs(x = "% flagged as outlier, raw scale", y = "% flagged, log10 scale",
+       title = "Most 'outliers' disappear\nafter log transformation")
+```
+
+Plausibility check on a few clinical variables (examined adults): are there
+values that are physiologically impossible rather than just extreme?
+
+```{r plausibility}
+examined %>%
+  filter(RIDAGEYR >= 20) %>%
+  select(BMXBMI, BMXHT, BMXWT, BPXOSY1, BPXODI1, BPXOPLS1, LBXGH, LBXHGB) %>%
+  pivot_longer(everything(), names_to = "variable") %>%
+  group_by(variable) %>%
+  summarise(n = sum(!is.na(value)), min = min(value, na.rm = TRUE),
+            median = median(value, na.rm = TRUE), max = max(value, na.rm = TRUE)) %>%
+  left_join(select(var_info, variable, label), by = "variable") %>%
+  knitr::kable(digits = 1)
+```
+
+# Redundancy and correlation
+
+## Unit duplicates are perfectly correlated
+
+```{r duplicate-correlation}
+duplicate_pairs <- var_info %>%
+  filter(role %in% c("measurement", "unit duplicate"), file != "FASTQX_L") %>%
+  group_by(file, base_label) %>% filter(n() > 1) %>%
+  summarise(primary = first(variable), duplicate = nth(variable, 2), .groups = "drop") %>%
+  mutate(correlation = map2_dbl(primary, duplicate,
+                                ~ cor(nhanes_raw[[.x]], nhanes_raw[[.y]], use = "complete.obs")))
+
+nrow(duplicate_pairs)
+summary(duplicate_pairs$correlation)
+
+# pairs that are not exactly 1 (rounding of low values in one of the two units)
+duplicate_pairs %>% filter(correlation < 0.999)
+```
+
+## Correlation between key clinical variables
+
+Spearman correlation (rank-based, so robust to skewness and outliers) between
+key variables in examined adults, ordered by hierarchical clustering. The three
+replicate blood-pressure readings are included on purpose.
+
+```{r fig-correlation, fig.height = 8, fig.width = 9}
+corr_vars <- c("RIDAGEYR", "INDFMPIR", "BMXWT", "BMXHT", "BMXBMI", "BMXWAIST", "BMXHIP",
+               "BMXARMC", "BPXOSY1", "BPXOSY2", "BPXOSY3", "BPXODI1", "BPXOPLS1",
+               "LBXGH", "LBXSGL", "LBDHDD", "LBXTC", "LBXSTR", "LBXHSCRP", "LBXWBCSI",
+               "LBXHGB", "LBXPLTSI", "LBXCOT", "LBXSATSI", "LBXSASSI", "LBXSGTSI",
+               "LBXSCR", "LBXSUA", "LBXVIDMS", "LBXBPB", "LBXBCD", "LBXSAL")
+
+corr_mat <- examined %>%
+  filter(RIDAGEYR >= 20) %>%
+  select(all_of(corr_vars)) %>%
+  cor(method = "spearman", use = "pairwise.complete.obs")
+
+var_order <- rownames(corr_mat)[hclust(as.dist(1 - abs(corr_mat)))$order]
+
+as_tibble(corr_mat, rownames = "var1") %>%
+  pivot_longer(-var1, names_to = "var2", values_to = "rho") %>%
+  mutate(var1 = factor(var1, var_order), var2 = factor(var2, var_order)) %>%
+  ggplot(aes(var1, var2, fill = rho)) +
+  geom_tile() +
+  scale_fill_gradient2(low = okabe_ito[4], mid = "white", high = okabe_ito[5],
+                       limits = c(-1, 1)) +
+  coord_equal() +
+  labs(x = NULL, y = NULL, fill = "Spearman \u03c1",
+       title = "Correlation structure of key variables (examined adults)",
+       subtitle = "blocks: body size, blood pressure (3 replicate readings), liver enzymes, lipids") +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1))
+```
+
+# Quality control with PCA: biology or technical factors?
+
+To check whether participants group by biology or by a technical factor, we run
+an **exploratory** PCA on examined adults. Two technical / design factors are
+available: the six-month period of the examination (`RIDEXMON`, season) and
+the examination session (`PHDSESNZ`; 0 = morning, 1 = afternoon/evening, which
+also determines whether the participant was fasting).
+
+Choices made only for this exploration (the final ones belong in the
+preprocessing script):
+
+* continuous exam and lab measurements with < 10 % missing in examined adults;
+* complete cases only;
+* log10 transformation of right-skewed variables (skewness > 1); a small offset
+  (half the smallest positive value) is added when a variable contains zeros;
+* standardisation (mean 0, SD 1) so that no variable dominates through its unit.
+
+```{r pca}
+adults_examined <- examined %>% filter(RIDAGEYR >= 20)
+
+pca_vars <- continuous_vars[colMeans(is.na(adults_examined[continuous_vars])) < 0.10]
+
+pca_input <- adults_examined %>%
+  select(SEQN, RIDAGEYR, RIAGENDR, RIDEXMON, PHDSESNZ, all_of(pca_vars)) %>%
+  drop_na(all_of(pca_vars))
+
+log_if_skewed <- function(x) {
+  if (skewness(x) <= 1 || min(x) < 0) return(x)
+  offset <- if (min(x) == 0) min(x[x > 0]) / 2 else 0
+  log10(x + offset)
+}
+
+pca_matrix <- pca_input %>% select(all_of(pca_vars)) %>%
+  mutate(across(everything(), log_if_skewed)) %>%
+  as.matrix()
+
+pca <- prcomp(pca_matrix, center = TRUE, scale. = TRUE)
+
+c(variables = length(pca_vars), participants = nrow(pca_input),
+  dropped_incomplete = nrow(adults_examined) - nrow(pca_input))
+```
+
+```{r fig-pca-scree, fig.height = 3.5}
+tibble(PC = seq_along(pca$sdev), var_explained = 100 * pca$sdev^2 / sum(pca$sdev^2)) %>%
+  slice_head(n = 15) %>%
+  ggplot(aes(PC, var_explained)) +
+  geom_col(fill = okabe_ito[4]) +
+  geom_line() + geom_point() +
+  labs(x = "principal component", y = "% variance explained",
+       title = "Scree plot: variance is spread over many components")
+```
+
+```{r fig-pca-scores, fig.height = 8, fig.width = 10}
+var_pct <- round(100 * pca$sdev^2 / sum(pca$sdev^2), 1)
+
+scores <- as_tibble(pca$x[, 1:2]) %>%
+  bind_cols(pca_input %>% transmute(
+    sex       = factor(RIAGENDR, 1:2, c("Male", "Female")),
+    age_group = cut(RIDAGEYR, c(19, 39, 59, 80), labels = c("20-39", "40-59", "60-80")),
+    period    = factor(RIDEXMON, 1:2, c("Nov-Apr", "May-Oct")),
+    session   = factor(PHDSESNZ, 0:1, c("morning", "afternoon/evening"))
+  ))
+
+pca_panel <- function(colour_var, title) {
+  ggplot(scores, aes(PC1, PC2, colour = .data[[colour_var]])) +
+    geom_point(size = 0.6, alpha = 0.5) +
+    scale_colour_manual(values = okabe_ito, na.value = "grey70") +
+    labs(x = paste0("PC1 (", var_pct[1], " %)"), y = paste0("PC2 (", var_pct[2], " %)"),
+         colour = NULL, title = title) +
+    guides(colour = guide_legend(override.aes = list(size = 2, alpha = 1)))
+}
+
+(pca_panel("sex", "biology: sex") | pca_panel("age_group", "biology: age")) /
+  (pca_panel("period", "technical: six-month period") |
+     pca_panel("session", "technical: exam session")) +
+  plot_annotation(title = "PCA of examined adults coloured by biological and technical factors")
+```
+
+Which variables drive the first two components?
+
+```{r pca-loadings}
+as_tibble(pca$rotation[, 1:2], rownames = "variable") %>%
+  pivot_longer(-variable, names_to = "PC", values_to = "loading") %>%
+  group_by(PC) %>% slice_max(abs(loading), n = 8) %>% ungroup() %>%
+  left_join(select(var_info, variable, label), by = "variable") %>%
+  select(PC, variable, label, loading) %>%
+  knitr::kable(digits = 2)
+```
+
+# Summary: what the preprocessing script has to deal with
+
+```{r summary-numbers, include = FALSE}
+n_measurement  <- sum(var_info$role == "measurement")
+n_not_examined <- sum(nhanes_raw$RIDSTATR == 1)
+n_adults_exam  <- nrow(adults_examined)
+n_dup          <- sum(var_info$role == "unit duplicate")
+n_codes_vars   <- n_distinct(special_codes$variable)
+n_lod_half     <- sum(lod_info$pct_below_lod > 50)
+n_skewed       <- sum(distribution_summary$skewness > 1, na.rm = TRUE)
+```
+
+* **Variables.** Only `r n_measurement` of the 486 columns are candidate
+  features; the others are the identifier, survey weights and design variables,
+  comment codes and `r n_dup` unit duplicates (correlation ≈ 1, keep one of each).
+* **Samples.** `r n_not_examined` participants were interviewed but never
+  examined and have no exam or lab data; children have many adult measures
+  missing by design. Most analyses will use the `r n_adults_exam` examined
+  adults (≥ 20 y).
+* **Missing data are structural, not random.** Missingness follows the study
+  design (examination status, age, fasting and other subsamples). Variables
+  measured only in a subsample must either be analysed within that subsample
+  or left out; imputing them would invent data for people who were never
+  eligible.
+* **Disguised missing values.** `r n_codes_vars` variables contain codes for
+  refused / don't know that must be recoded to `NA` (see table in section 5.1).
+* **Top-coding.** Age (80) and income-to-poverty ratio (5) are capped.
+* **Limit of detection.** `r n_lod_half` lab tests have more than half of the
+  values below the LOD; these values are substitutes, not measurements (MNAR).
+  Such variables carry little information as continuous features.
+* **Skewness.** `r n_skewed` of `r length(continuous_vars)` continuous
+  variables have skewness > 1: log transformation is needed before parametric
+  tests, PCA or distance-based methods. Most IQR "outliers" are tail values of
+  skewed distributions rather than errors.
+* **Biology that must be modelled.** Strong sex differences (e.g.
+  testosterone) and age effects: sex and age are natural adjustment variables.
+* **Survey design.** NHANES is a weighted, stratified sample. Unweighted
+  analyses describe this sample, not the US population (limitation to report).
+
+# Session information
+
+```{r session-info}
+sessionInfo()
+```
